@@ -1161,6 +1161,7 @@ export const GameObjRawPrototype: Omit<
             ?? (this.parent
                 ? this.parent._drawLayerIndex
                 : _k.game.defaultLayerIndex);
+        if (this.children.length === 0) return;
         const children = this.children.slice();
         for (let i = 0; i < children.length; i++) {
             children[i].update();
@@ -1170,6 +1171,7 @@ export const GameObjRawPrototype: Omit<
     fixedUpdate(this: InternalGameObjRaw) {
         if (this.paused) return;
         this._fixedUpdateEvents.trigger();
+        if (this.children.length === 0) return;
         const children = this.children.slice();
         for (let i = 0; i < children.length; i++) {
             children[i].fixedUpdate();
