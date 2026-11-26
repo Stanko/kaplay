@@ -122,6 +122,8 @@ export type VertexFormat = {
     size: number;
 }[];
 
+const MAX_INDEXED_VERTICES = 65_536;
+
 /**
  * @group Rendering
  * @subgroup Canvas
@@ -131,11 +133,11 @@ export class BatchRenderer {
 
     glVBuf: WebGLBuffer;
     glIBuf: WebGLBuffer;
-    vqueue: number[] = [];
-    iqueue: number[] = [];
+    private vertexQueue: Float32Array;
+    private indexQueue: Uint16Array;
+    private queuedVertexFloats = 0;
+    private queuedIndices = 0;
     stride: number;
-    maxVertices: number;
-    maxIndices: number;
 
     vertexFormat: VertexFormat;
     numDraws: number = 0;
@@ -152,33 +154,26 @@ export class BatchRenderer {
     constructor(
         ctx: GfxCtx,
         format: VertexFormat,
-        maxVertices: number,
-        maxIndices: number,
+        vertexFloatCapacity: number,
+        indexCapacity: number,
     ) {
         const gl = ctx.gl;
 
         this.vertexFormat = format;
         this.ctx = ctx;
         this.stride = format.reduce((sum, f) => sum + f.size, 0);
-        this.maxVertices = maxVertices;
-        this.maxIndices = maxIndices;
 
         const glVBuf = gl.createBuffer();
+        const glIBuf = gl.createBuffer();
 
-        if (!glVBuf) {
-            throw new Error("Failed to create vertex buffer");
+        if (!glVBuf || !glIBuf) {
+            throw new Error("Failed to create batch buffers");
         }
 
         this.glVBuf = glVBuf;
-
-        ctx.pushArrayBuffer(this.glVBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, maxVertices * 4, gl.DYNAMIC_DRAW);
-        ctx.popArrayBuffer();
-
-        this.glIBuf = gl.createBuffer()!;
-        ctx.pushElementArrayBuffer(this.glIBuf);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, maxIndices * 4, gl.DYNAMIC_DRAW);
-        ctx.popElementArrayBuffer();
+        this.glIBuf = glIBuf;
+        this.vertexQueue = this.allocateVertexQueue(vertexFloatCapacity);
+        this.indexQueue = this.allocateIndexQueue(indexCapacity);
     }
 
     push(
@@ -194,15 +189,15 @@ export class BatchRenderer {
         fixed: boolean,
         vertexFloatCount = vertices.length,
     ) {
+        const indexCount = indices.length;
         // If we have a picture, redirect data to the picture instead
         if (this.picture) {
             const index = this.picture.indices.length;
-            const count = indices.length;
             const indexOffset = this.picture.vertices.length / this.stride;
             for (let i = 0; i < vertexFloatCount; i++) {
                 this.picture.vertices.push(vertices[i]);
             }
-            for (let i = 0; i < count; i++) {
+            for (let i = 0; i < indexCount; i++) {
                 this.picture.indices.push(indices[i] + indexOffset);
             }
             const material = {
@@ -221,21 +216,31 @@ export class BatchRenderer {
                     && lastMaterial.uniform == material.uniform
                     && lastMaterial.blend == material.blend
                 ) {
-                    lastCommand.count += count;
+                    lastCommand.count += indexCount;
                     return;
                 }
             }
             const command = {
                 material,
                 index,
-                count,
+                count: indexCount,
             };
             this.picture.commands.push(command);
             return;
         }
 
-        // If texture, shader, blend mode or uniforms (including fixed) have changed, flush first
-        // If the buffers are full, flush first
+        if (vertexFloatCount === 0 || indexCount === 0) return;
+
+        const maxIndexedVertexFloats = MAX_INDEXED_VERTICES * this.stride;
+        // An oversized draw may still reference only the first 65,536 vertices.
+        if (
+            vertexFloatCount > maxIndexedVertexFloats
+            && indices.some(index => index >= MAX_INDEXED_VERTICES)
+        ) {
+            throw new RangeError("Draw exceeds the 16-bit vertex index range");
+        }
+
+        // Flush on a state change, a full queue, or before indices could wrap.
         if (
             primitive !== this.curPrimitive
             || tex !== this.curTex
@@ -244,20 +249,33 @@ export class BatchRenderer {
                 && !deepEq(this.curUniform, uniform))
             || blend !== this.curBlend
             || fixed !== this.curFixed
-            || this.vqueue.length + vertexFloatCount * this.stride
-                > this.maxVertices
-            || this.iqueue.length + indices.length > this.maxIndices
+            || this.queuedVertexFloats + vertexFloatCount
+                > this.vertexQueue.length
+            || this.queuedVertexFloats + vertexFloatCount
+                > maxIndexedVertexFloats
+            || this.queuedIndices + indexCount > this.indexQueue.length
         ) {
             this.flush(width, height);
             this.setBlend(blend);
         }
-        const indexOffset = this.vqueue.length / this.stride;
+        if (vertexFloatCount > this.vertexQueue.length) {
+            this.vertexQueue = this.allocateVertexQueue(vertexFloatCount);
+        }
+        if (indexCount > this.indexQueue.length) {
+            this.indexQueue = this.allocateIndexQueue(indexCount);
+        }
+
+        const vertexStart = this.queuedVertexFloats;
+        const indexStart = this.queuedIndices;
+        const firstVertex = vertexStart / this.stride;
         for (let i = 0; i < vertexFloatCount; i++) {
-            this.vqueue.push(vertices[i]);
+            this.vertexQueue[vertexStart + i] = vertices[i];
         }
-        for (let i = 0; i < indices.length; i++) {
-            this.iqueue.push(indices[i] + indexOffset);
+        for (let i = 0; i < indexCount; i++) {
+            this.indexQueue[indexStart + i] = indices[i] + firstVertex;
         }
+        this.queuedVertexFloats = vertexStart + vertexFloatCount;
+        this.queuedIndices = indexStart + indexCount;
         this.curPrimitive = primitive;
         this.curShader = shader;
         this.curTex = tex;
@@ -267,10 +285,9 @@ export class BatchRenderer {
 
     flush(width: number, height: number) {
         if (
-            !this.curPrimitive
+            this.curPrimitive === null
             || !this.curShader
-            || this.vqueue.length === 0
-            || this.iqueue.length === 0
+            || this.queuedIndices === 0
         ) {
             return;
         }
@@ -279,14 +296,18 @@ export class BatchRenderer {
 
         // Bind vertex data
         this.ctx.pushArrayBuffer(this.glVBuf);
-        gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(this.vqueue));
+        gl.bufferSubData(
+            gl.ARRAY_BUFFER,
+            0,
+            this.vertexQueue.subarray(0, this.queuedVertexFloats),
+        );
 
         // Bind index data
         this.ctx.pushElementArrayBuffer(this.glIBuf);
         gl.bufferSubData(
             gl.ELEMENT_ARRAY_BUFFER,
             0,
-            new Uint16Array(this.iqueue),
+            this.indexQueue.subarray(0, this.queuedIndices),
         );
 
         // Set vertex format
@@ -314,7 +335,7 @@ export class BatchRenderer {
         // Draw vertex buffer using active indices
         gl.drawElements(
             this.curPrimitive,
-            this.iqueue.length,
+            this.queuedIndices,
             gl.UNSIGNED_SHORT,
             0,
         );
@@ -328,11 +349,33 @@ export class BatchRenderer {
         this.ctx.popElementArrayBuffer();
 
         // Reset local buffers
-        this.vqueue.length = 0;
-        this.iqueue.length = 0;
+        this.queuedVertexFloats = 0;
+        this.queuedIndices = 0;
 
         // Increase draw
         this.numDraws++;
+    }
+
+    private allocateVertexQueue(capacity: number) {
+        const { gl } = this.ctx;
+        const queue = new Float32Array(capacity);
+        this.ctx.pushArrayBuffer(this.glVBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, queue.byteLength, gl.DYNAMIC_DRAW);
+        this.ctx.popArrayBuffer();
+        return queue;
+    }
+
+    private allocateIndexQueue(capacity: number) {
+        const { gl } = this.ctx;
+        const queue = new Uint16Array(capacity);
+        this.ctx.pushElementArrayBuffer(this.glIBuf);
+        gl.bufferData(
+            gl.ELEMENT_ARRAY_BUFFER,
+            queue.byteLength,
+            gl.DYNAMIC_DRAW,
+        );
+        this.ctx.popElementArrayBuffer();
+        return queue;
     }
 
     free() {
