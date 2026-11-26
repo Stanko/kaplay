@@ -1,12 +1,16 @@
 import { DEF_ANCHOR } from "../../constants/general";
 import { Color } from "../../math/color";
 import { Quad } from "../../math/math";
-import { Vec2 } from "../../math/Vec2";
+import type { Vec2 } from "../../math/Vec2";
 import { type Anchor, BlendMode, type RenderProps } from "../../types";
 import { anchorPt } from "../anchor";
 import type { Texture } from "../gfx";
 import { drawRaw } from "./drawRaw";
-import { drawUVQuad } from "./drawUVQuad";
+import {
+    drawTexturedQuad,
+    FULL_TEXTURE_REGION,
+    type TextureRegion,
+} from "./drawUVQuad";
 
 /**
  * How the texture should look like.
@@ -30,20 +34,35 @@ export function drawTexture(opt: DrawTextureOpt) {
         throw new Error("drawTexture() requires property \"tex\".");
     }
 
-    const q = opt.quad ?? new Quad(0, 0, 1, 1);
-    const w = opt.tex.width * q.w;
-    const h = opt.tex.height * q.h;
+    drawTextureRegion(
+        opt,
+        opt.tex,
+        opt.quad ?? FULL_TEXTURE_REGION,
+        opt.width,
+        opt.height,
+    );
+}
+
+export function drawTextureRegion(
+    opt: Omit<DrawTextureOpt, "tex" | "quad" | "width" | "height">,
+    texture: Texture,
+    region: TextureRegion,
+    width?: number,
+    height?: number,
+) {
+    const tileWidth = texture.width * region.w;
+    const tileHeight = texture.height * region.h;
+    width ??= tileWidth;
+    height ??= tileHeight;
 
     if (opt.tiled) {
         const offset = anchorPt(opt.anchor ?? DEF_ANCHOR);
-        const offsetX = (opt.pos?.x ?? 0)
-            - (offset.x + 1) * 0.5 * (opt.width ?? w);
-        const offsetY = (opt.pos?.y ?? 0)
-            - (offset.y + 1) * 0.5 * (opt.height ?? h);
+        const offsetX = (opt.pos?.x ?? 0) - (offset.x + 1) * 0.5 * width;
+        const offsetY = (opt.pos?.y ?? 0) - (offset.y + 1) * 0.5 * height;
 
         // cSpell: ignore fcols frows
-        const fcols = (opt.width ?? w) / w;
-        const frows = (opt.height ?? h) / h;
+        const fcols = width / tileWidth;
+        const frows = height / tileHeight;
         const cols = Math.floor(fcols);
         const rows = Math.floor(frows);
         const fracX = fcols - cols;
@@ -58,10 +77,6 @@ export function drawTexture(opt: DrawTextureOpt) {
         };
         let index = 0;
 
-        /*drawUVQuad(Object.assign({}, opt, {
-            scale: scale.scale(opt.scale ?? new Vec2(1)),
-        }));*/
-
         const color = opt.color ?? Color.WHITE;
         const opacity = opt.opacity ?? 1;
 
@@ -70,7 +85,7 @@ export function drawTexture(opt: DrawTextureOpt) {
             y: number,
             w: number,
             h: number,
-            q: Quad,
+            q: TextureRegion,
         ) => {
             indices[index * 6 + 0] = index * 4 + 0;
             indices[index * 6 + 1] = index * 4 + 1;
@@ -120,16 +135,22 @@ export function drawTexture(opt: DrawTextureOpt) {
 
         for (let j = 0; j < rows; j++) {
             for (let i = 0; i < cols; i++) {
-                addQuad(i * w, j * h, w, h, q);
+                addQuad(
+                    i * tileWidth,
+                    j * tileHeight,
+                    tileWidth,
+                    tileHeight,
+                    region,
+                );
             }
 
             if (fracX) {
                 addQuad(
-                    cols * w,
-                    j * h,
-                    w * fracX,
-                    h,
-                    new Quad(q.x, q.y, q.w * fracX, q.h),
+                    cols * tileWidth,
+                    j * tileHeight,
+                    tileWidth * fracX,
+                    tileHeight,
+                    new Quad(region.x, region.y, region.w * fracX, region.h),
                 );
             }
         }
@@ -137,21 +158,26 @@ export function drawTexture(opt: DrawTextureOpt) {
         if (fracY) {
             for (let i = 0; i < cols; i++) {
                 addQuad(
-                    i * w,
-                    rows * h,
-                    w,
-                    h * fracY,
-                    new Quad(q.x, q.y, q.w, q.h * fracY),
+                    i * tileWidth,
+                    rows * tileHeight,
+                    tileWidth,
+                    tileHeight * fracY,
+                    new Quad(region.x, region.y, region.w, region.h * fracY),
                 );
             }
 
             if (fracX) {
                 addQuad(
-                    cols * w,
-                    rows * h,
-                    w * fracX,
-                    h * fracY,
-                    new Quad(q.x, q.y, q.w * fracX, q.h * fracY),
+                    cols * tileWidth,
+                    rows * tileHeight,
+                    tileWidth * fracX,
+                    tileHeight * fracY,
+                    new Quad(
+                        region.x,
+                        region.y,
+                        region.w * fracX,
+                        region.h * fracY,
+                    ),
                 );
             }
         }
@@ -160,19 +186,13 @@ export function drawTexture(opt: DrawTextureOpt) {
             attributes,
             indices,
             opt.fixed,
-            opt.tex,
+            texture,
             opt.shader,
             opt.uniform ?? undefined,
             opt.blend ?? BlendMode.Normal,
         );
     }
     else {
-        drawUVQuad(Object.assign({}, opt, {
-            scale: opt.scale ?? Vec2.ONE,
-            tex: opt.tex,
-            quad: q,
-            width: opt.width ?? w,
-            height: opt.height ?? h,
-        }));
+        drawTexturedQuad(opt, width, height, texture, region);
     }
 }

@@ -1,7 +1,7 @@
 import { DEF_ANCHOR } from "../../constants/general";
 import { Color } from "../../math/color";
-import { Quad } from "../../math/math";
-import { Vec2 } from "../../math/Vec2";
+import type { Quad } from "../../math/math";
+import type { Vec2 } from "../../math/Vec2";
 import { type Anchor, BlendMode, type RenderProps } from "../../types";
 import { anchorPt } from "../anchor";
 import type { Texture } from "../gfx";
@@ -53,79 +53,85 @@ export type DrawUVQuadOpt = RenderProps & {
     anchor?: Anchor | Vec2;
 };
 
+export type TextureRegion = Pick<Quad, "x" | "y" | "w" | "h">;
+
+export const FULL_TEXTURE_REGION: Readonly<TextureRegion> = Object.freeze({
+    x: 0,
+    y: 0,
+    w: 1,
+    h: 1,
+});
+
+const quadAttributes = {
+    pos: [0, 0, 0, 0, 0, 0, 0, 0],
+    uv: [0, 0, 0, 0, 0, 0, 0, 0],
+    color: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    opacity: [0, 0, 0, 0],
+};
+const QUAD_INDICES = [0, 1, 3, 1, 2, 3];
+
 export function drawUVQuad(opt: DrawUVQuadOpt) {
-    if (opt.width === undefined || opt.height === undefined) {
+    const { width, height, tex, quad } = opt;
+    if (width === undefined || height === undefined) {
         throw new Error(
             "drawUVQuad() requires property \"width\" and \"height\".",
         );
     }
+    drawTexturedQuad(opt, width, height, tex, quad ?? FULL_TEXTURE_REGION);
+}
 
-    if (opt.width <= 0 || opt.height <= 0) {
+export function drawTexturedQuad(
+    opt: Omit<DrawUVQuadOpt, "width" | "height" | "tex" | "quad">,
+    width: number,
+    height: number,
+    texture: Texture | undefined,
+    region: TextureRegion,
+) {
+    if (width <= 0 || height <= 0) {
         return;
     }
 
-    const w = opt.width;
-    const h = opt.height;
+    const halfWidth = width / 2;
+    const halfHeight = height / 2;
     const anchor = anchorPt(opt.anchor || DEF_ANCHOR);
-    const offsetX = anchor.x * w * -0.5;
-    const offsetY = anchor.y * h * -0.5;
-    const q = opt.quad || new Quad(0, 0, 1, 1);
     const color = opt.color || Color.WHITE;
     const opacity = opt.opacity ?? 1;
 
     pushTransform();
     multTranslateV(opt.pos);
     multRotate(opt.angle);
-    multScaleV(opt.scale);
+    multScaleV(opt.scale ?? undefined);
     multSkewV(opt.skew);
-    multTranslate(offsetX, offsetY);
+    multTranslate(-anchor.x * halfWidth, -anchor.y * halfHeight);
+
+    // Corners run from bottom left to top left, top right, and bottom right.
+    const { pos, uv, color: colors, opacity: opacities } = quadAttributes;
+    pos[0] = pos[2] = -halfWidth;
+    pos[4] = pos[6] = halfWidth;
+    pos[1] = pos[7] = halfHeight;
+    pos[3] = pos[5] = -halfHeight;
+
+    const left = opt.flipX ? region.x + region.w : region.x;
+    const right = opt.flipX ? region.x : region.x + region.w;
+    const top = opt.flipY ? region.y + region.h : region.y;
+    const bottom = opt.flipY ? region.y : region.y + region.h;
+    uv[0] = uv[2] = left;
+    uv[4] = uv[6] = right;
+    uv[1] = uv[7] = bottom;
+    uv[3] = uv[5] = top;
+
+    for (let i = 0; i < colors.length; i += 3) {
+        colors[i] = color.r;
+        colors[i + 1] = color.g;
+        colors[i + 2] = color.b;
+    }
+    opacities.fill(opacity);
 
     drawRaw(
-        {
-            pos: [
-                -w / 2,
-                h / 2,
-                -w / 2,
-                -h / 2,
-                w / 2,
-                -h / 2,
-                w / 2,
-                h / 2,
-            ],
-            uv: [
-                opt.flipX ? q.x + q.w : q.x,
-                opt.flipY ? q.y : q.y + q.h,
-                opt.flipX ? q.x + q.w : q.x,
-                opt.flipY ? q.y + q.h : q.y,
-                opt.flipX ? q.x : q.x + q.w,
-                opt.flipY ? q.y + q.h : q.y,
-                opt.flipX ? q.x : q.x + q.w,
-                opt.flipY ? q.y : q.y + q.h,
-            ],
-            color: [
-                color.r,
-                color.g,
-                color.b,
-                color.r,
-                color.g,
-                color.b,
-                color.r,
-                color.g,
-                color.b,
-                color.r,
-                color.g,
-                color.b,
-            ],
-            opacity: [
-                opacity,
-                opacity,
-                opacity,
-                opacity,
-            ],
-        },
-        [0, 1, 3, 1, 2, 3],
+        quadAttributes,
+        QUAD_INDICES,
         opt.fixed,
-        opt.tex,
+        texture,
         opt.shader,
         opt.uniform ?? undefined,
         opt.blend ?? BlendMode.Normal,

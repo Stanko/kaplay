@@ -5,6 +5,9 @@ import { type Attributes, BlendMode, type RenderProps } from "../../types";
 import type { Texture } from "../gfx";
 import { height, width } from "../stack";
 
+// The renderer copies the populated prefix before returning.
+const packedVertices: number[] = [];
+
 export function drawRaw(
     attributes: Attributes,
     indices: number[],
@@ -22,30 +25,27 @@ export function drawRaw(
         return;
     }
 
-    const transform = _k.gfx.transform;
+    const { transform, scratchPt: point } = _k.gfx;
+    const vertexCount = attributes.pos.length / 2;
+    let writeIndex = 0;
+    for (let i = 0; i < vertexCount; i++) {
+        point.x = attributes.pos[i * 2];
+        point.y = attributes.pos[i * 2 + 1];
+        transform.transformPointV(point, point);
 
-    const vertLength = attributes.pos.length / 2;
-    const vv: number[] = new Array(vertLength * 8);
-
-    let index = 0;
-    for (let i = 0; i < vertLength; i++) {
-        _k.gfx.scratchPt.x = attributes.pos[i * 2];
-        _k.gfx.scratchPt.y = attributes.pos[i * 2 + 1];
-        transform.transformPointV(_k.gfx.scratchPt, _k.gfx.scratchPt);
-
-        vv[index++] = _k.gfx.scratchPt.x;
-        vv[index++] = _k.gfx.scratchPt.y;
-        vv[index++] = attributes.uv[i * 2];
-        vv[index++] = attributes.uv[i * 2 + 1];
-        vv[index++] = attributes.color[i * 3] / 255;
-        vv[index++] = attributes.color[i * 3 + 1] / 255;
-        vv[index++] = attributes.color[i * 3 + 2] / 255;
-        vv[index++] = attributes.opacity[i];
+        packedVertices[writeIndex++] = point.x;
+        packedVertices[writeIndex++] = point.y;
+        packedVertices[writeIndex++] = attributes.uv[i * 2];
+        packedVertices[writeIndex++] = attributes.uv[i * 2 + 1];
+        packedVertices[writeIndex++] = attributes.color[i * 3] / 255;
+        packedVertices[writeIndex++] = attributes.color[i * 3 + 1] / 255;
+        packedVertices[writeIndex++] = attributes.color[i * 3 + 2] / 255;
+        packedVertices[writeIndex++] = attributes.opacity[i];
     }
 
     _k.gfx.renderer.push(
         _k.gfx.ggl.gl.TRIANGLES,
-        vv,
+        packedVertices,
         indices,
         shader,
         parsedTex,
@@ -54,5 +54,6 @@ export function drawRaw(
         width(),
         height(),
         _k.gfx.fixed || fixed,
+        writeIndex,
     );
 }

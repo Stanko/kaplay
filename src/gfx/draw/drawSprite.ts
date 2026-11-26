@@ -1,13 +1,13 @@
 import type { Asset } from "../../assets/asset";
 import { resolveSprite, SpriteData } from "../../assets/sprite";
 import { DEF_ANCHOR } from "../../constants/general";
-import { Quad, quad } from "../../math/math";
+import { type Quad, quad } from "../../math/math";
 import { Vec2 } from "../../math/Vec2";
 import type { Anchor, RenderProps } from "../../types";
 import { warn } from "../../utils/log";
 import { anchorPt } from "../anchor";
 import type { Texture } from "../gfx";
-import { drawTexture } from "./drawTexture";
+import { drawTexture, drawTextureRegion } from "./drawTexture";
 
 /**
  * How the sprite should look like.
@@ -160,17 +160,30 @@ export function drawSprite(opt: DrawSpriteOpt) {
         }
     }
     else {
-        const scale = calcTexScale(frame.tex, frame.q, opt.width, opt.height);
-        const width = opt.width ?? frame.tex.width * frame.q.w * scale.x;
-        const height = opt.height ?? frame.tex.height * frame.q.h * scale.y;
+        const frameWidth = frame.tex.width * frame.q.w;
+        const frameHeight = frame.tex.height * frame.q.h;
+        const width = opt.width ?? (opt.height
+            ? frameWidth * (opt.height / frameHeight)
+            : frameWidth);
+        const height = opt.height ?? (opt.width
+            ? frameHeight * (opt.width / frameWidth)
+            : frameHeight);
 
-        drawTexture(
-            Object.assign({}, opt, {
-                tex: frame.tex,
-                quad: frame.q.scale(opt.quad ?? new Quad(0, 0, 1, 1)),
-                width,
-                height,
-            }),
+        let region = frame.q;
+        const crop = opt.quad;
+        if (
+            crop
+            && (crop.x !== 0 || crop.y !== 0 || crop.w !== 1 || crop.h !== 1)
+        ) {
+            region = region.scale(crop);
+        }
+
+        drawTextureRegion(
+            opt,
+            frame.tex,
+            region,
+            width,
+            height,
         );
     }
 }

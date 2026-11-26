@@ -192,18 +192,17 @@ export class BatchRenderer {
         width: number,
         height: number,
         fixed: boolean,
+        vertexFloatCount = vertices.length,
     ) {
         // If we have a picture, redirect data to the picture instead
         if (this.picture) {
             const index = this.picture.indices.length;
             const count = indices.length;
             const indexOffset = this.picture.vertices.length / this.stride;
-            let l = vertices.length;
-            for (let i = 0; i < l; i++) {
+            for (let i = 0; i < vertexFloatCount; i++) {
                 this.picture.vertices.push(vertices[i]);
             }
-            l = indices.length;
-            for (let i = 0; i < l; i++) {
+            for (let i = 0; i < count; i++) {
                 this.picture.indices.push(indices[i] + indexOffset);
             }
             const material = {
@@ -245,7 +244,7 @@ export class BatchRenderer {
                 && !deepEq(this.curUniform, uniform))
             || blend !== this.curBlend
             || fixed !== this.curFixed
-            || this.vqueue.length + vertices.length * this.stride
+            || this.vqueue.length + vertexFloatCount * this.stride
                 > this.maxVertices
             || this.iqueue.length + indices.length > this.maxIndices
         ) {
@@ -253,12 +252,10 @@ export class BatchRenderer {
             this.setBlend(blend);
         }
         const indexOffset = this.vqueue.length / this.stride;
-        let l = vertices.length;
-        for (let i = 0; i < l; i++) {
+        for (let i = 0; i < vertexFloatCount; i++) {
             this.vqueue.push(vertices[i]);
         }
-        l = indices.length;
-        for (let i = 0; i < l; i++) {
+        for (let i = 0; i < indices.length; i++) {
             this.iqueue.push(indices[i] + indexOffset);
         }
         this.curPrimitive = primitive;
