@@ -9,300 +9,317 @@ import {
     objectTransformNeedsUpdate,
 } from "../../ecs/entity/GameObjRaw";
 import { exists, isPaused } from "../../ecs/entity/utils";
-import { drawRect } from "../../gfx/draw/drawRect";
-import { loadIdentity, pushMatrix } from "../../gfx/stack";
 import type { GameObj } from "../../types";
-import { type Rect, vec2 } from "../math";
+import type { Rect } from "../math";
 import { calcTransform } from "../various";
-import type { Vec2 } from "../Vec2";
 
 export type HashGridOpt = {
     hashGridSize?: number;
 };
 
+type AreaObject = GameObj<AreaComp>;
+
+type GridEntry = {
+    cellIndices: number[];
+    transformVersion: number;
+    renderAreaVersion: number | undefined;
+    localAreaVersion: number;
+};
+
 export class HashGrid {
-    bounds: Rect;
-    cellSize: number;
-    columns: number;
-    grid: Array<Array<GameObj<AreaComp>>> = [];
-    hashesForObject: Map<GameObj<AreaComp>, Array<number>> = new Map<
-        GameObj<AreaComp>,
-        Array<number>
-    >();
-    versionsForObject: Map<GameObj<AreaComp>, [number, number, number]> =
-        new Map<
-            GameObj<AreaComp>,
-            [number, number, number]
-        >();
+    private readonly bounds: Rect;
+    private readonly cellSize: number;
+    private columns = 0;
+    private rows = 0;
+    private cells: AreaObject[][] = [];
+    private readonly entriesByObject = new Map<AreaObject, GridEntry>();
+    private readonly cellIndexScratch: number[] = [];
 
     constructor(bounds: Rect, opt: HashGridOpt) {
         this.bounds = bounds.clone();
         this.cellSize = opt.hashGridSize || DEF_HASH_GRID_SIZE;
-        this._clampBoundsToCellSize();
-        this.columns = Math.floor(this.bounds.width / this.cellSize);
+        this.setBounds(
+            bounds.pos.x,
+            bounds.pos.y,
+            bounds.pos.x + bounds.width,
+            bounds.pos.y + bounds.height,
+        );
     }
 
-    add(obj: GameObj<AreaComp>) {
-        const bbox = obj.worldBbox();
-        if (!this._isInside(bbox)) {
-            this._resizeToFit(bbox);
+    add(object: AreaObject) {
+        const bounds = object.worldBbox();
+        if (!this.containsBounds(bounds)) {
+            this.resizeToFit(bounds);
         }
-        // Add the object to all cells covered by its bbox
-        const hashes = this._hashRect(bbox);
-        for (let i = 0; i < hashes.length; i++) {
-            const hash = hashes[i];
-            this._addObjectToGridByHash(obj, hash);
+
+        const cellIndices: number[] = [];
+        this.writeCellIndices(bounds, cellIndices);
+        for (const cellIndex of cellIndices) {
+            this.addToCell(object, cellIndex);
         }
-        this.hashesForObject.set(obj, hashes);
-        this.versionsForObject.set(obj, [
-            getTransformVersion(obj),
-            getRenderAreaVersion(obj),
-            getLocalAreaVersion(obj),
-        ]);
+
+        this.entriesByObject.set(object, {
+            cellIndices,
+            transformVersion: getTransformVersion(object),
+            renderAreaVersion: getRenderAreaVersion(object),
+            localAreaVersion: getLocalAreaVersion(object),
+        });
     }
 
-    remove(obj: GameObj<AreaComp>) {
-        // Remove the object from all cells it is contained in
-        const hashes = this.hashesForObject.get(obj);
-        if (hashes) {
-            for (let i = 0; i < hashes.length; i++) {
-                const hash = hashes[i];
-                this._removeObjectFromGridByHash(obj, hash);
+    remove(object: AreaObject) {
+        const entry = this.entriesByObject.get(object);
+        if (entry) {
+            for (const cellIndex of entry.cellIndices) {
+                this.removeFromCell(object, cellIndex);
             }
+            this.entriesByObject.delete(object);
         }
-        this.hashesForObject.delete(obj);
-        this.versionsForObject.delete(obj);
     }
 
     clear() {
-        this.grid = [];
-        this.hashesForObject.clear();
-        this.versionsForObject.clear();
+        this.cells = [];
+        this.entriesByObject.clear();
     }
 
     update() {
-        const oldSet = new Set<number>();
-        const newSet = new Set<number>();
-        for (const [obj, oldHashes] of this.hashesForObject) {
-            // Check if this world area changed since last frame
-            const versions = this.versionsForObject.get(obj);
+        const nextCells = this.cellIndexScratch;
+        for (const [object, entry] of this.entriesByObject) {
+            const transformVersion = getTransformVersion(object);
+            const renderAreaVersion = getRenderAreaVersion(object);
+            const localAreaVersion = getLocalAreaVersion(object);
             if (
-                versions![0] === getTransformVersion(obj)
-                && versions![1] === getRenderAreaVersion(obj)
-                && versions![2] === getLocalAreaVersion(obj)
+                entry.transformVersion === transformVersion
+                && entry.renderAreaVersion === renderAreaVersion
+                && entry.localAreaVersion === localAreaVersion
             ) {
-                // No change
                 continue;
             }
 
-            if (objectTransformNeedsUpdate(obj)) {
-                calcTransform(obj, obj.transform);
+            if (objectTransformNeedsUpdate(object)) {
+                calcTransform(object, object.transform);
             }
             else {
-                versions![0] = getTransformVersion(obj);
+                entry.transformVersion = transformVersion;
             }
-            versions![1] = getRenderAreaVersion(obj);
-            versions![2] = getLocalAreaVersion(obj);
+            entry.renderAreaVersion = renderAreaVersion;
+            entry.localAreaVersion = localAreaVersion;
 
-            // Retrieve the old hashes
-            for (let i = 0; i < oldHashes.length; i++) {
-                const hash = oldHashes[i];
-                oldSet.add(hash);
+            this.writeCellIndices(object.worldBbox(), nextCells);
+            const previousCells = entry.cellIndices;
+            if (!sameCellIndices(previousCells, nextCells)) {
+                this.updateCellMembership(object, previousCells, nextCells);
             }
-            // Get the hashes of the updated world bbox
-            const newHashes = this._hashRect(obj.worldBbox());
-            for (let i = 0; i < newHashes.length; i++) {
-                const hash = newHashes[i];
-                newSet.add(hash);
-            }
-            // Check if there is a difference between old and new hashes
-            if (oldSet.symmetricDifference(newSet).size == 0) {
-                oldSet.clear();
-                newSet.clear();
-                // No change
-                continue;
-            }
-            // Remove the object from cells it no longer occupies
-            for (const hash of oldSet.difference(newSet)) {
-                this._removeObjectFromGridByHash(obj, hash);
-            }
-            // Add the object to newly occupied cells
-            for (const hash of newSet.difference(oldSet)) {
-                this._addObjectToGridByHash(obj, hash);
-            }
-            // Replace the hashes
-            oldHashes.length = 0;
-            for (let i = 0; i < newHashes.length; i++) {
-                const hash = newHashes[i];
-                oldHashes.push(hash);
-            }
-            oldSet.clear();
-            newSet.clear();
         }
-
-        /*for (const i in this.grid) {
-            loadIdentity();
-            if (this.grid[i].length) {
-                drawRect({
-                    pos: vec2(i % this.columns, Math.floor(i / this.columns))
-                        .scale(this.cellSize),
-                    width: this.cellSize,
-                    height: this.cellSize,
-                });
-            }
-        }*/
     }
 
-    /**
-     * Iterates all object pairs which potentially collide
-     */
-    iterPairs(
-        pairCb: (obj1: GameObj<AreaComp>, obj2: GameObj<AreaComp>) => void,
-    ) {
-        const checked = new Set<GameObj<AreaComp>>();
-        for (const [obj1, hashes] of this.hashesForObject) {
-            if (!isValidCollisionObject(obj1)) continue;
-            checked.add(obj1);
-            const collisions = new Set<GameObj<AreaComp>>();
-            for (let i = 0; i < hashes.length; i++) {
-                const hash = hashes[i];
-                for (const obj2 of this.grid[hash]) {
-                    if (isValidCollisionObject(obj2) && !checked.has(obj2)) {
-                        collisions.add(obj2);
+    /** Visits each potential collision pair once. */
+    iterPairs(onPair: (object: AreaObject, candidate: AreaObject) => void) {
+        const cellsAtStart = this.cells;
+        const processedObjects = new Set<AreaObject>();
+
+        // Earlier collision callbacks can change which objects are eligible.
+        for (const [object, { cellIndices }] of this.entriesByObject) {
+            // Rebuilding replaces the cells and can reinsert visited objects.
+            if (this.cells !== cellsAtStart && processedObjects.has(object)) {
+                continue;
+            }
+            if (!isCollisionEligible(object)) continue;
+            processedObjects.add(object);
+
+            const candidates = new Set<AreaObject>();
+            for (let i = 0; i < cellIndices.length; i++) {
+                const cell = this.cells[cellIndices[i]];
+                for (let j = 0; j < cell.length; j++) {
+                    const candidate = cell[j];
+                    if (
+                        !processedObjects.has(candidate)
+                        && isCollisionEligible(candidate)
+                    ) {
+                        candidates.add(candidate);
                     }
                 }
             }
-            for (const obj2 of collisions) {
-                pairCb(obj1, obj2);
+
+            for (const candidate of candidates) {
+                onPair(object, candidate);
             }
         }
     }
 
-    /**
-     * Retrieves all object which potentially collide with the rectangle
-     */
-    retrieve(rect: Rect, retrieveCb: (obj: GameObj<AreaComp>) => void) {
-        // Get the hashes of the covered cells
-        const hashes = this._hashRect(rect);
-        // Collect the objects inside the cells
-        const hits = new Set<GameObj<AreaComp>>();
-        for (let i = 0; i < hashes.length; i++) {
-            const hash = hashes[i];
-            const cell = this.grid[hash];
+    /** Visits objects in the cells covered by the rectangle. */
+    retrieve(rect: Rect, onMatch: (object: AreaObject) => void) {
+        const cellIndices = this.cellIndexScratch;
+        this.writeCellIndices(rect, cellIndices);
+
+        const matches = new Set<AreaObject>();
+        for (let i = 0; i < cellIndices.length; i++) {
+            const cell = this.cells[cellIndices[i]];
             if (cell) {
-                for (let i = 0; i < cell.length; i++) {
-                    hits.add(cell[i]);
+                for (let j = 0; j < cell.length; j++) {
+                    matches.add(cell[j]);
                 }
             }
         }
-        hits.forEach(retrieveCb);
+
+        matches.forEach(onMatch);
     }
 
-    private _hashPoint(point: Vec2) {
-        const x = Math.floor((point.x - this.bounds.pos.x) / this.cellSize);
-        const y = Math.floor((point.y - this.bounds.pos.y) / this.cellSize);
-        return x + y * this.columns;
-    }
-
-    private _hashRect(rect: Rect) {
-        rect = rect.clone();
-
-        // Clamp rect
-        // TODO: remove this once update resizes too
-        if (rect.pos.x < this.bounds.pos.x) {
-            const diff = this.bounds.pos.x - rect.pos.x;
-            rect.pos.x = this.bounds.pos.x;
-            rect.width -= diff;
-        }
-        if (rect.pos.y < this.bounds.pos.y) {
-            const diff = this.bounds.pos.y - rect.pos.y;
-            rect.pos.y = this.bounds.pos.y;
-            rect.height -= diff;
-        }
-        if (rect.pos.x + rect.width > this.bounds.pos.x + this.bounds.width) {
-            rect.width = this.bounds.pos.x + this.bounds.width - rect.pos.x;
-        }
-        if (rect.pos.y + rect.height > this.bounds.pos.y + this.bounds.height) {
-            rect.height = this.bounds.pos.y + this.bounds.height - rect.pos.y;
+    private writeCellIndices(rect: Rect, cellIndices: number[]) {
+        const gridLeft = this.bounds.pos.x;
+        const gridTop = this.bounds.pos.y;
+        const left = Math.max(rect.pos.x, gridLeft);
+        const top = Math.max(rect.pos.y, gridTop);
+        const right = Math.min(
+            rect.pos.x + rect.width,
+            gridLeft + this.bounds.width,
+        );
+        const bottom = Math.min(
+            rect.pos.y + rect.height,
+            gridTop + this.bounds.height,
+        );
+        if (left > right || top > bottom) {
+            cellIndices.length = 0;
+            return;
         }
 
-        // Calculate hashes
-        const w = Math.floor(this.bounds.width / this.cellSize);
-        let hash = this._hashPoint(rect.pos);
-        const hashes = [];
-        const rw = Math.ceil(rect.width / this.cellSize);
-        const rh = Math.ceil(rect.height / this.cellSize);
-        for (let y = 0; y <= rh; y++) {
-            for (let x = 0; x <= rw; x++) {
-                hashes.push(hash);
-                hash++;
+        // Include both edges so touching rectangles share a cell.
+        const firstColumn = Math.min(
+            this.columns - 1,
+            Math.floor((left - gridLeft) / this.cellSize),
+        );
+        const lastColumn = Math.min(
+            this.columns - 1,
+            Math.floor((right - gridLeft) / this.cellSize),
+        );
+        const firstRow = Math.min(
+            this.rows - 1,
+            Math.floor((top - gridTop) / this.cellSize),
+        );
+        const lastRow = Math.min(
+            this.rows - 1,
+            Math.floor((bottom - gridTop) / this.cellSize),
+        );
+
+        // Row-major order gives the membership update a sorted, unique list.
+        let count = 0;
+        for (let row = firstRow; row <= lastRow; row++) {
+            const rowStart = row * this.columns;
+            for (let column = firstColumn; column <= lastColumn; column++) {
+                cellIndices[count++] = rowStart + column;
             }
-            hash += w - rw - 1;
         }
-        return hashes;
+        cellIndices.length = count;
     }
 
-    private _addObjectToGridByHash(obj: GameObj<AreaComp>, hash: number) {
-        if (!this.grid[hash]) {
-            this.grid[hash] = [];
+    private updateCellMembership(
+        object: AreaObject,
+        previousCells: number[],
+        nextCells: number[],
+    ) {
+        let previousIndex = 0;
+        let nextIndex = 0;
+        while (
+            previousIndex < previousCells.length && nextIndex < nextCells.length
+        ) {
+            const previousCell = previousCells[previousIndex];
+            const nextCell = nextCells[nextIndex];
+            if (previousCell === nextCell) {
+                previousIndex++;
+                nextIndex++;
+            }
+            else if (previousCell < nextCell) {
+                this.removeFromCell(object, previousCell);
+                previousIndex++;
+            }
+            else {
+                this.addToCell(object, nextCell);
+                nextIndex++;
+            }
         }
-        this.grid[hash].push(obj);
+        for (; previousIndex < previousCells.length; previousIndex++) {
+            this.removeFromCell(object, previousCells[previousIndex]);
+        }
+        for (; nextIndex < nextCells.length; nextIndex++) {
+            this.addToCell(object, nextCells[nextIndex]);
+        }
+
+        previousCells.length = nextCells.length;
+        for (let i = 0; i < nextCells.length; i++) {
+            previousCells[i] = nextCells[i];
+        }
     }
 
-    private _removeObjectFromGridByHash(obj: GameObj<AreaComp>, hash: number) {
-        const objects = this.grid[hash];
-        const index = objects.indexOf(obj);
+    private addToCell(object: AreaObject, cellIndex: number) {
+        (this.cells[cellIndex] ??= []).push(object);
+    }
+
+    private removeFromCell(object: AreaObject, cellIndex: number) {
+        const cell = this.cells[cellIndex];
+        const index = cell.indexOf(object);
         if (index >= 0) {
-            objects.splice(index, 1);
+            cell.splice(index, 1);
         }
     }
 
-    private _isInside(bbox: Rect) {
-        return bbox.pos.x >= this.bounds.pos.x
-            && bbox.pos.y >= this.bounds.pos.y
-            && bbox.pos.x + bbox.width <= this.bounds.pos.x + this.bounds.width
-            && bbox.pos.y + bbox.height
+    private containsBounds(rect: Rect) {
+        return rect.pos.x >= this.bounds.pos.x
+            && rect.pos.y >= this.bounds.pos.y
+            && rect.pos.x + rect.width <= this.bounds.pos.x + this.bounds.width
+            && rect.pos.y + rect.height
                 <= this.bounds.pos.y + this.bounds.height;
     }
 
-    private _resizeToFit(bbox: Rect) {
-        // Rectangle union
-        this.bounds.pos.x = Math.min(this.bounds.pos.x, bbox.pos.x);
-        this.bounds.pos.y = Math.min(this.bounds.pos.y, bbox.pos.y);
-        this.bounds.width = Math.max(
-            this.bounds.pos.x + this.bounds.width,
-            bbox.pos.x + bbox.width,
-        ) - this.bounds.pos.x;
-        this.bounds.height = Math.max(
-            this.bounds.pos.y + this.bounds.height,
-            bbox.pos.y + bbox.height,
-        ) - this.bounds.pos.y;
+    private resizeToFit(rect: Rect) {
+        this.setBounds(
+            Math.min(this.bounds.pos.x, rect.pos.x),
+            Math.min(this.bounds.pos.y, rect.pos.y),
+            Math.max(
+                this.bounds.pos.x + this.bounds.width,
+                rect.pos.x + rect.width,
+            ),
+            Math.max(
+                this.bounds.pos.y + this.bounds.height,
+                rect.pos.y + rect.height,
+            ),
+        );
 
-        this._clampBoundsToCellSize();
-        this.columns = Math.floor(this.bounds.width / this.cellSize);
-
-        // TODO: Recalculate hashes instead of restarting from scratch
-        const objects = [...this.hashesForObject.keys()];
-
+        const objects = [...this.entriesByObject.keys()];
         this.clear();
-
-        for (const obj of objects) {
-            this.add(obj);
+        for (const object of objects) {
+            this.add(object);
         }
     }
 
-    private _clampBoundsToCellSize() {
-        this.bounds.pos.x = Math.floor(this.bounds.pos.x / this.cellSize)
-            * this.cellSize;
-        this.bounds.pos.y = Math.floor(this.bounds.pos.y / this.cellSize)
-            * this.cellSize;
-        this.bounds.width = Math.ceil(this.bounds.width / this.cellSize)
-            * this.cellSize;
-        this.bounds.height = Math.ceil(this.bounds.height / this.cellSize)
-            * this.cellSize;
+    private setBounds(
+        left: number,
+        top: number,
+        right: number,
+        bottom: number,
+    ) {
+        const firstColumn = Math.floor(left / this.cellSize);
+        const firstRow = Math.floor(top / this.cellSize);
+        this.columns = Math.max(
+            1,
+            Math.ceil(right / this.cellSize) - firstColumn,
+        );
+        this.rows = Math.max(1, Math.ceil(bottom / this.cellSize) - firstRow);
+        this.bounds.pos.x = firstColumn * this.cellSize;
+        this.bounds.pos.y = firstRow * this.cellSize;
+        this.bounds.width = this.columns * this.cellSize;
+        this.bounds.height = this.rows * this.cellSize;
     }
 }
 
-function isValidCollisionObject(obj: GameObj) {
-    return exists(obj) && (obj.isSensor || obj.has("body")) && !isPaused(obj);
+function sameCellIndices(previousCells: number[], nextCells: number[]) {
+    if (previousCells.length !== nextCells.length) return false;
+    for (let i = 0; i < previousCells.length; i++) {
+        if (previousCells[i] !== nextCells[i]) return false;
+    }
+    return true;
+}
+
+function isCollisionEligible(object: AreaObject) {
+    return exists(object)
+        && (object.isSensor || object.has("body"))
+        && !isPaused(object);
 }
